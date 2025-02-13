@@ -12,7 +12,7 @@ from torch.distributions import Categorical
 # =============================
 class TradingEnv(gym.Env):
     def __init__(self, data, initial_balance=100_000, fee_rate=0.0001, holding_cost=0.000001, 
-                 drawdown_penalty_rate=0.01, min_balance=100, data_index=None, position_size_percentage=0.1, max_candles=15000):
+                 drawdown_penalty_rate=0.01, disable_penalty=False, min_balance=100, data_index=None, position_size_percentage=0.1, max_candles=15000):
         super(TradingEnv, self).__init__()
         # Reset index data
         self.data_index = data_index
@@ -23,6 +23,7 @@ class TradingEnv(gym.Env):
         self.fee_rate = fee_rate
         self.holding_cost = holding_cost
         self.drawdown_penalty_rate = drawdown_penalty_rate
+        self.disable_penalty = disable_penalty
         self.min_balance = min_balance
         self.position_size_percentage = position_size_percentage
         self.max_candles = max_candles
@@ -158,7 +159,7 @@ class TradingEnv(gym.Env):
                 self.open_price = current_price
         else:
             # Jika aksi adalah HOLD (atau memilih aksi yang sama dengan posisi yang sedang berjalan)
-            reward = -self.holding_cost
+            if not self.disable_penalty: reward = -self.holding_cost
 
         # Update penalti drawdown
         self.max_balance = max(self.max_balance, self.current_balance)
@@ -166,7 +167,8 @@ class TradingEnv(gym.Env):
             drawdown = (self.max_balance - self.current_balance) / self.max_balance
         else:
             drawdown = 0.0
-        reward -= drawdown * self.drawdown_penalty_rate
+        
+        if not self.disable_penalty: reward -= drawdown * self.drawdown_penalty_rate
 
         # Pindah ke step berikutnya
         self.current_step += 1
@@ -290,7 +292,7 @@ def main():
     min_balance = 100
     position_size_percentage = 0.2  # 0.1% dari initial balance
     env = TradingEnv(data, initial_balance=100_000, min_balance=min_balance, data_index=data_index, 
-                     position_size_percentage=position_size_percentage)
+                     position_size_percentage=position_size_percentage, disable_penalty=True, fee_rate=0.01/100)
     input_dim = 16  # 14 fitur + current_mode + current_log_return
     action_dim = 3  # [LONG, SHORT, HOLD]
     print('Inisialisasi Actor-Critic Agent...')
