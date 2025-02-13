@@ -1,3 +1,4 @@
+import os
 import gymnasium as gym
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ from torch.distributions import Categorical
 # =============================
 class TradingEnv(gym.Env):
     def __init__(self, data, initial_balance=100_000, fee_rate=0.0001, holding_cost=0.000001, 
-                 drawdown_penalty_rate=0.01, min_balance=100, data_index=None, position_size_percentage=0.1, max_candles=43800):
+                 drawdown_penalty_rate=0.01, min_balance=100, data_index=None, position_size_percentage=0.1, max_candles=15000):
         super(TradingEnv, self).__init__()
         # Reset index data
         self.data_index = data_index
@@ -277,8 +278,11 @@ def ppo_update(agent, optimizer, trajectories, clip_epsilon=0.2, epochs=10):
 # 3. Training Loop
 # =============================
 def main():
+    versi = '0.0.1'
+    checkpoint = f"brains/ppo_trading_checkpoint_{versi}.pth"
     print('Memuat data: data/processed.pkl')
     data = pd.read_pickle('data/processed.pkl')
+    data = data[data.index.year>=2023]
     data_index = data.index
     print('Data berhasil dimuat.')
 
@@ -292,6 +296,14 @@ def main():
     print('Inisialisasi Actor-Critic Agent...')
     agent = ActorCritic(input_dim, hidden_dim1=64, hidden_dim2=32, action_dim=action_dim)
     optimizer = optim.Adam(agent.parameters(), lr=3e-4)
+
+        # Cek apakah checkpoint tersedia dan muat jika ada
+    if os.path.isfile(checkpoint):
+        print(f"Memuat checkpoint dari {checkpoint}...")
+        agent.load_state_dict(torch.load(checkpoint))
+        print("Checkpoint berhasil dimuat.")
+    else:
+        print("Tidak ada checkpoint yang ditemukan. Memulai training dari awal.")
 
     num_episodes = 1000
     gamma = 0.99
@@ -362,7 +374,8 @@ def main():
 
         if (episode + 1) % 100 == 0:
             print(f"Menyimpan checkpoint model episode {episode+1}...")
-            torch.save(agent.state_dict(), f"ppo_trading_checkpoint_{episode+1}.pth")
+            # torch.save(agent.state_dict(), f"ppo_trading_checkpoint_{episode+1}.pth")
+            torch.save(agent.state_dict(), checkpoint)
             print(f"Checkpoint episode {episode+1} berhasil disimpan.")
 
     print('\nTraining Loop selesai.')
