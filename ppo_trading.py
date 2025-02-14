@@ -1,4 +1,5 @@
 import os
+import random
 import gymnasium as gym
 import numpy as np
 import pandas as pd
@@ -11,11 +12,22 @@ from torch.distributions import Categorical
 # 1. Environment Trading
 # =============================
 class TradingEnv(gym.Env):
-    def __init__(self, data, initial_balance=100_000, fee_rate=0.0001, holding_cost=0.000001, 
-                 drawdown_penalty_rate=0.01, disable_penalty=False, min_balance=100, data_index=None, position_size_percentage=0.1, max_candles=15000):
+    def __init__(self, data, 
+                 initial_balance=100_000, 
+                 fee_rate=0.0001, 
+                 holding_cost=0.000001, 
+                 drawdown_penalty_rate=0.01,
+                 disable_penalty=False, 
+                 min_balance=100, 
+                 data_index=[], 
+                 position_size_percentage=0.1, 
+                 random_start_index=False, 
+                 max_candles=15000):
         super(TradingEnv, self).__init__()
+
         # Reset index data
-        self.data_index = data_index
+        self.data_index = data_index if len(data_index)>0 else data.index
+        self.random_start_index = random_start_index
         self.data = data.reset_index(drop=True)
         self.initial_balance = initial_balance
         self.current_balance = initial_balance
@@ -31,7 +43,7 @@ class TradingEnv(gym.Env):
 
         # Status posisi: 0 = tidak ada posisi, 1 = LONG, -1 = SHORT
         self.current_mode = 0
-        self.open_price = 0.0
+        self.open_price = None # None supaya bisa check saat hitung current_log_return
         self.current_step = 0
         self.current_time = self.data_index[self.current_step] if self.data_index is not None else None
 
@@ -55,8 +67,10 @@ class TradingEnv(gym.Env):
         self.current_balance = self.initial_balance
         self.max_balance = self.initial_balance
         self.current_mode = 0
-        self.open_price = 0.0
+        self.open_price = None
         self.current_step = 0
+        if self.random_start_index:
+            self.current_step = random.randint(0, len(self.data)-1)
         self.current_candle = 0
         self.current_time = self.data_index[self.current_step] if self.data_index is not None else None
 
@@ -65,135 +79,133 @@ class TradingEnv(gym.Env):
         current_log_return = 0.0
         obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
         return obs
-
+    
     def step(self, action_idx):
         self.current_candle += 1
         action = self.action_map[action_idx]
+        prev_mode = self.current_mode
         done = False
         reward = 0.0
-
-        # Ambil harga saat ini
-        current_row = self.data.iloc[self.current_step]
-        current_price = current_row['open']
-        if self.data_index is not None:
-            self.current_time = self.data_index[self.current_step]
+        info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": False}
 
         # Tentukan ukuran posisi
         position_size = self.initial_balance * self.position_size_percentage
 
-        # Jika balance di bawah minimum, episode selesai
-        if self.current_balance < self.min_balance:
-            print(f"Balance di bawah minimum ({self.current_balance:,.0f} < {self.min_balance:,.0f}). Mengakhiri episode.")
-            done = True
-            # reward = -1.0
-            info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": True, "reason": "balance_too_low"}
-            row = self.data.iloc[-1]
-            obs_features = row[self.feature_cols].values.astype(np.float32)
-            current_log_return = 0.0
-            obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
-            return obs, reward, done, info
-        elif self.current_candle > self.max_candles:
-            print(f"Mencapai batas candle ({self.current_candle} > {self.max_candles}). Mengakhiri episode.")
-            done = True
-            # reward = -1.0
-            info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": True, "reason": "max_candles_reached"}
-            row = self.data.iloc[-1]
-            obs_features = row[self.feature_cols].values.astype(np.float32)
-            current_log_return = 0.0
-            obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
-            return obs, reward, done, info
+        # Ambil harga saat ini
+        row = self.data.iloc[self.current_step]
+        current_price = row['open']
+        
+        if self.data_index is not None:
+            self.current_time = self.data_index[self.current_step]
+        
+        # Hitung log return jika open price tersedia
+        current_log_return = 0
+        profit_pct = 0
+        pnl = 0
+        fee = 0
+        if self.open_price is not None:
+            current_log_return = np.log((current_price + 1e-8) / (self.open_price + 1e-8))
+            profit_pct = ((current_price - self.open_price) / self.open_price) * self.current_mode
+            pnl = profit_pct * position_size
+        
+        unrealized_balance = self.current_balance + pnl
+        gain = unrealized_balance - self.initial_balance
+        reward = gain/self.initial_balance
 
-        # Jika sudah mencapai akhir data, pastikan posisi ditutup
-        if self.current_step >= len(self.data) - 1:
-            if self.current_mode != 0:
-                if self.current_mode == 1:  # LONG
-                    profit_pct = (current_price - self.open_price) / self.open_price
-                elif self.current_mode == -1:  # SHORT
-                    profit_pct = (self.open_price - current_price) / self.open_price
-
-                trade_profit = position_size * profit_pct
-                fee_close = position_size * self.fee_rate
-                self.current_balance += trade_profit - fee_close
-                reward += (trade_profit - fee_close) / self.initial_balance
-                self.current_mode = 0
-            done = True
-            info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": False}
-            row = self.data.iloc[-1]
-            obs_features = row[self.feature_cols].values.astype(np.float32)
-            current_log_return = 0.0
-            obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
-            return obs, reward, done, info
-
-        # Jika aksi berbeda dari posisi saat ini (misal, membuka posisi baru atau mengganti posisi)
-        if action != 0 and action != self.current_mode:
-            # Jika sudah ada posisi, tutup posisi tersebut terlebih dahulu
-            if self.current_mode != 0:
-                if self.current_mode == 1:
-                    profit_pct = (current_price - self.open_price) / self.open_price
-                elif self.current_mode == -1:
-                    profit_pct = (self.open_price - current_price) / self.open_price
-
-                trade_profit = position_size * profit_pct
-                fee_close = position_size * self.fee_rate
-                self.current_balance += trade_profit - fee_close
-                reward += (trade_profit - fee_close) / self.initial_balance
-                self.current_mode = 0
-
-            # Buka posisi baru jika aksi bukan HOLD
-            if action != 0:
-                fee_open = position_size * self.fee_rate
-                # Pastikan balance cukup untuk fee membuka posisi
-                if self.current_balance < fee_open or (self.current_balance - fee_open) < self.min_balance:
-                    print("Balance tidak cukup untuk membuka posisi baru. Mengakhiri episode.")
-                    done = True
-                    reward = -1.0
-                    info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": True}
-                    row = self.data.iloc[-1]
-                    obs_features = row[self.feature_cols].values.astype(np.float32)
-                    current_log_return = 0.0
-                    obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
-                    return obs, reward, done, info
-                self.current_balance -= fee_open
-                reward -= fee_open / self.initial_balance
-                self.current_mode = action
+        # Buat status saat ini dari aksi 
+        status = 'UNKNOWN'
+        if action == 0:
+            if self.current_mode == 0:
+                status = 'IDLE'
+            elif self.current_mode == 1:
+                status = 'LONG'
+            elif self.current_mode == -1:
+                status = 'SHORT'
+        elif action == 1:
+            if self.current_mode == 0:
+                status = 'OPEN LONG'
                 self.open_price = current_price
+                fee = position_size * self.fee_rate
+                self.current_mode = 1
+                self.current_balance-= fee
+            elif self.current_mode == -1:
+                status = 'CLOSE SHORT'
+                self.open_price = None
+                self.current_mode = 0
+                self.current_balance-= fee
+            elif self.current_mode == 1:
+                status = 'LONG'
         else:
-            # Jika aksi adalah HOLD (atau memilih aksi yang sama dengan posisi yang sedang berjalan)
-            if not self.disable_penalty: reward = -self.holding_cost
+            if self.current_mode == 0:
+                status = 'OPEN SHORT'
+                self.open_price = current_price
+                fee = position_size * self.fee_rate
+                self.current_mode = -1
+                self.current_balance-= fee
+            elif self.current_mode == 1:
+                status = 'CLOSE LONG'
+                self.open_price = None
+                self.current_mode = 0
+                self.current_balance-= fee
+            elif self.current_mode == -1:
+                status = 'SHORT'
 
-        # Update penalti drawdown
-        self.max_balance = max(self.max_balance, self.current_balance)
+        if 'CLOSE' in status:
+            self.current_balance += pnl
+            gain =   self.current_balance - self.initial_balance
+            reward = gain/self.initial_balance
+
+        # Update drawdown penalty (apply always unless disabled)
+        self.max_balance = max(self.max_balance, unrealized_balance)
         if self.max_balance > 0:
             drawdown = (self.max_balance - self.current_balance) / self.max_balance
         else:
             drawdown = 0.0
-        
-        if not self.disable_penalty: reward -= drawdown * self.drawdown_penalty_rate
+        if not self.disable_penalty:
+            reward -= drawdown * self.drawdown_penalty_rate
 
-        # Pindah ke step berikutnya
-        self.current_step += 1
+        def _create_observation():
+            obs_features = row[self.feature_cols].values.astype(np.float32)
+            obs = np.concatenate([obs_features, np.array([prev_mode, current_log_return], dtype=np.float32)])
+            info['current_time'] = self.current_time
+            info['current_price'] = current_price
+            info['status'] = status
+            info['unrealized_balance'] = unrealized_balance
+            info['pnl'] = pnl
+            info['fee'] = fee
+            info['profit_pct'] = profit_pct
+            # jika ada nan di obs maka cetak warning
+            if np.isnan(obs).any():
+                print(f"Warning: Observation contains NaN values: {obs}")
+            return obs, reward, done, info
+
+
+        # Check for early termination conditions (balance too low or max candles reached)
+        if self.current_balance < self.min_balance:
+            print(f"Balance di bawah minimum ({self.current_balance:,.0f} < {self.min_balance:,.0f}). Mengakhiri episode.")
+            done = True
+            info["terminated"] = True
+            info["reason"] = "balance_too_low"
+        elif self.current_candle > self.max_candles:
+            print(f"Mencapai batas candle ({self.current_candle} > {self.max_candles}). Mengakhiri episode.")
+            done = True
+            info["terminated"] = True
+            info["reason"] = "max_candles_reached"
+
+        if done:
+            return _create_observation()
+
+        # Handle end of data
         if self.current_step >= len(self.data) - 1:
             done = True
+            _create_observation()
 
-        # Ambil observasi berikutnya
-        row = self.data.iloc[self.current_step] if not done else self.data.iloc[-1]
-        obs_features = row[self.feature_cols].values.astype(np.float32)
-        # Jika ada posisi terbuka, hitung current_log_return dengan benar
-        if self.current_mode != 0:
-            next_price = current_price  # Harga dari step sebelumnya sebagai pembanding
-            # Namun, untuk observasi baru, kita gunakan harga dari baris baru
-            next_row = self.data.iloc[self.current_step]
-            next_price = next_row['open']
-            if self.current_mode == 1:
-                current_log_return = np.log((next_price + 1e-8) / (self.open_price + 1e-8))
-            else:  # SHORT
-                current_log_return = np.log((self.open_price + 1e-8) / (next_price + 1e-8))
-        else:
-            current_log_return = 0.0
-        obs = np.concatenate([obs_features, np.array([self.current_mode, current_log_return], dtype=np.float32)])
+        # Move to the next step
+        self.current_step += 1
+        if self.current_step >= len(self.data) - 1 and not done: # done might be true from insufficient balance check
+            done = True
 
-        info = {"balance": self.current_balance, "max_balance": self.max_balance, "terminated": False}
-        return obs, reward, done, info
+        return _create_observation()
 
 # =============================
 # 2. PPO Agent dengan LSTM
@@ -284,15 +296,22 @@ def main():
     checkpoint = f"brains/ppo_trading_checkpoint_{versi}.pth"
     print('Memuat data: data/processed.pkl')
     data = pd.read_pickle('data/processed.pkl')
-    data = data[data.index.year>=2023]
+    # data = data[data.index.year>=2023]
+    data = data[data.index.minute % 15 == 0]
     data_index = data.index
     print('Data berhasil dimuat.')
 
     print('Inisialisasi Trading Environment...')
     min_balance = 100
-    position_size_percentage = 0.2  # 0.1% dari initial balance
-    env = TradingEnv(data, initial_balance=100_000, min_balance=min_balance, data_index=data_index, 
-                     position_size_percentage=position_size_percentage, disable_penalty=True, fee_rate=0.01/100)
+    position_size_percentage = 0.1  # 0.1% dari initial balance
+    env = TradingEnv(data, 
+                     initial_balance=100_000, 
+                     min_balance=min_balance, 
+                     data_index=data_index, 
+                     random_start_index=True,
+                     position_size_percentage=position_size_percentage, 
+                     disable_penalty=True, 
+                     fee_rate=0.01/100)
     input_dim = 16  # 14 fitur + current_mode + current_log_return
     action_dim = 3  # [LONG, SHORT, HOLD]
     print('Inisialisasi Actor-Critic Agent...')
@@ -354,7 +373,8 @@ def main():
 
             state = torch.tensor(next_state, dtype=torch.float32).to(device)
 
-            print(f"[{env.current_time}] Step: {env.current_step}, Action Index: {action.item()}, Action: {env.action_map[action.item()]:>2} -> Reward: {reward:.4f}, Balance: {info['balance']:,.0f}, Max Balance: {info['max_balance']:,.0f}")
+            # print(f"[{env.current_time}] Step: {env.current_step}, Action Index: {action.item()}, Action: {env.action_map[action.item()]:>2} -> Reward: {reward:.4f}, Balance: {info['balance']:,.0f}, Max Balance: {info['max_balance']:,.0f}")
+            print(f"[{env.current_time}] Step: {env.current_step}, Action: {env.action_map[action.item()]:>2} -> Reward: {reward:.4f}, Balance: {info['unrealized_balance']:,.0f}, Max Balance: {info['max_balance']:,.0f} {info['status']}")
 
             if info.get("terminated", False):
                 print("Episode diakhiri karena", info.get('reason', 'unknown_reason'))
@@ -374,11 +394,11 @@ def main():
 
         print(f"Episode {episode+1:4d} | Reward: {episode_reward:.4f} | Balance: {info['balance']:.2f}")
 
-        if (episode + 1) % 100 == 0:
-            print(f"Menyimpan checkpoint model episode {episode+1}...")
-            # torch.save(agent.state_dict(), f"ppo_trading_checkpoint_{episode+1}.pth")
-            torch.save(agent.state_dict(), checkpoint)
-            print(f"Checkpoint episode {episode+1} berhasil disimpan.")
+        # if (episode + 1) % 100 == 0:
+        print(f"Menyimpan checkpoint model episode {episode+1}...")
+        # torch.save(agent.state_dict(), f"ppo_trading_checkpoint_{episode+1}.pth")
+        torch.save(agent.state_dict(), checkpoint)
+        print(f"Checkpoint episode {episode+1} berhasil disimpan.")
 
     print('\nTraining Loop selesai.')
 
